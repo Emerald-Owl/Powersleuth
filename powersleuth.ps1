@@ -1,10 +1,12 @@
 param(
-    [string]
-    $startDate = "01/01/1980",
-    [string]
-    $endDate = ((Get-Date).AddDays(1)).ToString("MM/dd/yyyy"),
-    [int]
-    $maxEvents = 999999
+    [Alias("h")][switch] $help,
+    [string] $startDate = "01/01/1980",
+    [string] $endDate = ((Get-Date).AddDays(1)).ToString("MM/dd/yyyy"),
+    [int] $maxEvents = 999999,
+    [switch] $sysmon,
+    [switch] $extended,
+    [string] $csv,
+    [Alias("q")][switch] $quiet
 )
 
 # Check for MM/dd/yyyy formatting of the start date param
@@ -17,6 +19,59 @@ catch {
     return
 }
 
+function Get-Help {
+    Write-Output "NEEDS UPDATING
+        Usage: 
+            .\powersleuth.ps1 -d <num> [options]
+    
+        Options:
+            -h, -help                  Prints help information
+            -s, -search <string>       Conduct a search for a string. Not case sensitive. String or regex 
+            -d, -days <num>            Specify how many days back to search
+            -c, -csv <directory>       Export results as a csv file 
+            -o, -offline <directory>   Parse offline EVTX files, will use local logs otherwise
+            -p, -poll                  Look at account logins statistics
+            -l, -logins                Shows only login/logoff events (security and terminalservices)
+            -x, -xsearch <string>      Search for keyword across ALL event logs. Requires CSV. String or regex
+            -i, -ids <numbers>         Search by ID. Accepts a single ID or Regex, can be used with -s 
+            -q, -quiet                 Does not print results to terminal. Requires CSV output. 
+    
+        Examples:
+            .\powersleuth.ps1 -d 30 -p
+            .\powersleuth.ps1 -d 5 -l
+            .\powersleuth.ps1 -d 10 -s 'Administrator'
+            .\powersleuth.ps1 -d 10 -o 'E:\C\Windows\system32\winevt\Logs' -c '..\output\'
+            .\powersleuth.ps1 -d 60 -x 'psexe|anonymous' -o 'D:\C\Windows\System32\winevt\logs' -csv '..\Desktop\'
+        "
+}
+
+function Get-OutputPreCheck($CSV){
+    # Appends training backslash if it wasnt provided 
+    if ($CSV -notmatch "\\$"){
+        $CSV_fixed = "$CSV\"
+    }else{
+        $CSV_fixed = "$CSV"}
+    
+    # Check if the path exists, quits if not 
+    if ((Test-Path -Path $CSV_fixed) -eq $false){
+        write-host "The provided file path is not valid. Exiting."
+        Exit}
+    
+    # Checks if the path is a directory. If its a file, it quits 
+    if ((Get-Item $CSV_fixed) -isnot [System.IO.DirectoryInfo]){
+        write-host "The -csv parameter must be a directory. Exiting."
+        Exit}
+    
+    # Grabs a current timestamp to use as the filename. Then creates the file. 
+    $OutputFileName = Get-Date -Format "MM-dd-yy@HH-mm-ss"
+
+    #$OutputFile = "$CSV_fixed$OutputFileName.csv"
+    try{
+        New-Item -Path $CSV_fixed -Name "$OutputFileName.csv" -type "file"}
+    catch [Exception]{
+        write-host "Something went wrong creating the file! Exiting."
+        Exit }
+}
 
 function Get-UserSessions{
     # Collect params, start/end date, and how many events to grab. 
@@ -266,7 +321,7 @@ function Get-ServicesInstalled{
     [EventID=7045]]
 "@
 
-$events = Get-WinEvent -LogName "System" -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
+    $events = Get-WinEvent -LogName "System" -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
 
     foreach($event in $events) {
         $serviceName = $event.Properties[$servicePropertyMap.serviceName].Value
@@ -339,7 +394,7 @@ $events = Get-WinEvent -LogName "System" -FilterXPath $xpath -MaxEvents $maxEven
             'LogName'            = $event.LogName
             'Event ID'           = $event.Id
             'Message'            = "System Startup"
-            'Detail'             = $null
+            'Details'             = $null
         }
         results.Add($result)
     }
@@ -385,7 +440,7 @@ function Get-SystemShutdown{
             'LogName'            = $event.LogName
             'Event ID'           = $event.Id
             'Message'            = "System Startup"
-            'Detail'             = $null
+            'Details'             = $null
         }
         $results.Add($result)
     }
@@ -606,7 +661,7 @@ function Get-FailedLogons{
             'LogName'            = $event.LogName
             'Event ID'           = $event.Id
             'Message'            = "Failed login for $accountName from $sourceNetworkAddress"
-            'Detail'             =
+            'Details'             =
 @"
 Account Name: $accountName
 Account Domain: $accountDomain
@@ -741,81 +796,587 @@ function Get-GenericLogClearing{
     return $results
 }
 
+function Get-SecurityLogClearing{
+    # Collect params, start/end date, and how many events to grab. 
+    # Defaults to 99999 events and anything from 01/01/1980 to the day after execution 
+    param(
+        [Parameter(Mandatory=$true)]    
+        [datetime]
+        $startDate,
+
+        [Parameter(Mandatory=$true)]
+        [datetime]
+        $endDate,
+
+        [Parameter(Mandatory=$true)]
+        [int]
+        $maxEvents
+    )
+
+    $startDateUniversal = $startDate.ToUniversalTime().ToString('o')
+    $endDateUniversal = $endDate.ToUniversalTime().ToString('o')
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    $LoginpropertyMap = @{
+        AccountName = 1
+        logonID = 3
+    }
+
+    $xpath =    
+@"
+*[System
+    [TimeCreated
+        [@SystemTime>='$startDateUniversal' and 
+        @SystemTime<='$endDateUniversal']]
+    [EventID=1102]]
+"@
+
+    $events = Get-WinEvent -LogName "Security" -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
+
+    # Loop through each event
+    foreach ($event in $events) {
+        $accountName = $event.Properties[$LoginpropertyMap.AccountName].Value
+        $logonID = $event.Properties[$LoginpropertyMap.LogonID].Valued 
+        $logonIDFixed = '0x{0:X}' -f $logonID
+
+        # Add the extracted details to the results array
+        $result = [PSCustomObject]@{
+            'Time Created (UTC)' = $event.TimeCreated.ToUniversalTime()
+            'User'               = $event.UserId
+            'LogName'            = $event.LogName
+            'Event ID'           = $event.Id
+            'Message'            = "Security Event Log cleared by $accountName"
+            'Details'            = 
+@"
+Account Name: $accountName
+LogonID: $logonIDFixed
+"@ 
+        }
+        $results.Add($result)  
+    }
+
+    return $clearLogs
+}
+
+function Get-DefenderDetections{
+    # Collect params, start/end date, and how many events to grab. 
+    # Defaults to 99999 events and anything from 01/01/1980 to the day after execution 
+    param(
+        [Parameter(Mandatory=$true)]    
+        [datetime]
+        $startDate,
+
+        [Parameter(Mandatory=$true)]
+        [datetime]
+        $endDate,
+
+        [Parameter(Mandatory=$true)]
+        [int]
+        $maxEvents
+    )
+    
+    $startDateUniversal = $startDate.ToUniversalTime().ToString('o')
+    $endDateUniversal = $endDate.ToUniversalTime().ToString('o')
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    $LoginpropertyMap = @{
+        AccountName = 19
+        ThreatName = 7
+        Path = 21
+    }
+
+    $xpath =    
+@"
+*[System
+    [TimeCreated
+        [@SystemTime>='$startDateUniversal' and 
+        @SystemTime<='$endDateUniversal']]
+    [EventID=1116]]
+"@
+
+    $events = Get-WinEvent -LogName "Microsoft-Windows-Windows Defender/Operational" -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
+
+    # Loop through each event
+    foreach ($event in $events) {
+        $user = $event.Properties[$LoginpropertyMap.AccountName].Value
+        $threatName = $event.Properties[$LoginpropertyMap.ThreatName].Value
+        $path = $event.Properties[$LoginpropertyMap.Path].Value
+
+        # Add the extracted details to the results array
+        $result = [PSCustomObject]@{
+            'Time Created (UTC)' = $event.TimeCreated.ToUniversalTime()
+            'User'               = $event.UserId
+            'LogName'            = $event.LogName
+            'Event ID'           = $event.Id
+            'Message'            = "$threatName detected at $path"
+            'Details'            =
+@"
+Account Name: $user
+Threat Name: $threatName
+File Path: $path
+"@ 
+        }
+        $results.Add($result)
+    }
+    return $results 
+}
+
+function Get-SysmonProcessCreate{
+    # Collect params, start/end date, and how many events to grab. 
+    # Defaults to 99999 events and anything from 01/01/1980 to the day after execution 
+    param(
+        [Parameter(Mandatory=$true)]    
+        [datetime]
+        $startDate,
+
+        [Parameter(Mandatory=$true)]
+        [datetime]
+        $endDate,
+
+        [Parameter(Mandatory=$true)]
+        [int]
+        $maxEvents
+    )
+    
+    $startDateUniversal = $startDate.ToUniversalTime().ToString('o')
+    $endDateUniversal = $endDate.ToUniversalTime().ToString('o')
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    $LoginpropertyMap = @{
+        AccountName = 12
+        ProcessID = 3
+        OriginalFileName = 9
+        commandLine = 10
+        ParentCommandLine = 21
+    }
+
+    $xpath =    
+@"
+*[System
+    [TimeCreated
+        [@SystemTime>='$startDateUniversal' and 
+        @SystemTime<='$endDateUniversal']]
+    [EventID=1]]
+"@
+
+    $events = Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
+
+    foreach ($event in $events) {
+        $user = $event.Properties[$LoginpropertyMap.AccountName].Value
+        $ProcessID = $event.Properties[$LoginpropertyMap.ProcessID].Value
+        $OriginalFileName = $event.Properties[$LoginpropertyMap.OriginalFileName].Value
+        $commandLine = $event.Properties[$LoginpropertyMap.commandLine].Value
+        $ParentCommandLine = $event.Properties[$LoginpropertyMap.ParentCommandLine].Value
+
+        # Add the extracted details to the results array
+        $result = [PSCustomObject]@{
+            'Time Created (UTC)' = $event.TimeCreated.ToUniversalTime()
+            'User'               = $event.UserId
+            'LogName'            = $event.LogName
+            'Event ID'           = $event.Id
+            'Message'            = "$user launched $OriginalFileName"
+            'Details'            = 
+@"
+Account Name: $user
+ProcessID: $ProcessID
+File Name: $OriginalFileName
+Process Command Line: $commandLine
+Parent Process Command Line: $ParentCommandLine
+"@ 
+        }
+        $results.Add($result)
+    }
+    return $results
+}
+
+function Get-SysmonNetCreate{
+    # Collect params, start/end date, and how many events to grab. 
+    # Defaults to 99999 events and anything from 01/01/1980 to the day after execution 
+    param(
+        [Parameter(Mandatory=$true)]    
+        [datetime]
+        $startDate,
+
+        [Parameter(Mandatory=$true)]
+        [datetime]
+        $endDate,
+
+        [Parameter(Mandatory=$true)]
+        [int]
+        $maxEvents
+    )
+
+    $startDateUniversal = $startDate.ToUniversalTime().ToString('o')
+    $endDateUniversal = $endDate.ToUniversalTime().ToString('o')
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    $LoginpropertyMap = @{
+        AccountName = 5
+        destinationIp = 14
+        destinationHostname = 15
+        destinationPort = 16
+        processId = 3
+        image = 4
+    }
+
+    $xpath =    
+@"
+*[System
+    [TimeCreated
+        [@SystemTime>='$startDateUniversal' and 
+        @SystemTime<='$endDateUniversal']]
+    [EventID=3]]
+"@
+
+    $events = Get-WinEvent -LogName 'Microsoft-Windows-Sysmon/Operational' -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue  
+
+    foreach ($event in $events) {
+        $user = $event.Properties[$LoginpropertyMap.AccountName].Value
+        $destinationIp = $event.Properties[$LoginpropertyMap.destinationIp].Value
+        $destinationHostname = $event.Properties[$LoginpropertyMap.destinationHostname].Value
+        $destinationPort = $event.Properties[$LoginpropertyMap.destinationPort].Value
+        $processId = $event.Properties[$LoginpropertyMap.processId].Value
+        $image = $event.Properties[$LoginpropertyMap.image].Value
+        
+        $result = [PSCustomObject]@{
+            'Time Created (UTC)' = $event.TimeCreated.ToUniversalTime()
+            'User'               = $event.UserId
+            'LogName'            = $event.LogName
+            'Event ID'           = $event.Id
+            'Message'            = "$($image.split("\")[-1]) connected to $destinationIp ($destinationHostname) : $destinationPort"
+            'Details'            = 
+@"
+Account Name: $user
+Destination IP: $destinationIp
+Destination Port: $destinationPort
+Destination Hostname: $destinationHostname
+Initiating Process ID: $processId
+Initiating Process: $image
+"@ 
+        }
+        $results.Add($result)
+    }
+    return $results
+}
+
+function Get-SysmonFileCreate{
+    # Collect params, start/end date, and how many events to grab. 
+    # Defaults to 99999 events and anything from 01/01/1980 to the day after execution 
+    param(
+        [Parameter(Mandatory=$true)]    
+        [datetime]
+        $startDate,
+
+        [Parameter(Mandatory=$true)]
+        [datetime]
+        $endDate,
+
+        [Parameter(Mandatory=$true)]
+        [int]
+        $maxEvents
+    )
+
+    $startDateUniversal = $startDate.ToUniversalTime().ToString('o')
+    $endDateUniversal = $endDate.ToUniversalTime().ToString('o')
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    $LoginpropertyMap = @{
+        AccountName = 7
+        targetFilename = 5
+        processId = 3
+        image = 4
+    }
+
+    $xpath =    
+@"
+*[System
+    [TimeCreated
+        [@SystemTime>='$startDateUniversal' and 
+        @SystemTime<='$endDateUniversal']]
+    [EventID=11]]
+"@
+
+    $events = Get-WinEvent -LogName 'Microsoft-Windows-Sysmon/Operational' -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
+
+    foreach ($event in $events) {
+        $user = $event.Properties[$LoginpropertyMap.AccountName].Value
+        $targetFilename = $event.Properties[$LoginpropertyMap.targetFilename].Value
+        $processId = $event.Properties[$LoginpropertyMap.processId].Value
+        $image = $event.Properties[$LoginpropertyMap.image].Value
+        
+        $result = [PSCustomObject]@{
+            'Time Created (UTC)' = $event.TimeCreated.ToUniversalTime()
+            'User'               = $event.UserId
+            'LogName'            = $event.LogName
+            'Event ID'           = $event.Id
+            'Message'            = "$($image.split("\")[-1]) created file $targetFilename"
+            'Details'            = 
+@"
+Account Name: $user
+Target File Name: $targetFilename
+ProcessID: $processId
+Initiating Process: $image
+"@ 
+        }
+        $results.Add($result)
+    }
+    return $results
+}
+
+function Get-WFPBlocked{
+    # Collect params, start/end date, and how many events to grab. 
+    # Defaults to 99999 events and anything from 01/01/1980 to the day after execution 
+    param(
+        [Parameter(Mandatory=$true)]    
+        [datetime]
+        $startDate,
+
+        [Parameter(Mandatory=$true)]
+        [datetime]
+        $endDate,
+
+        [Parameter(Mandatory=$true)]
+        [int]
+        $maxEvents
+    )
+
+    $startDateUniversal = $startDate.ToUniversalTime().ToString('o')
+    $endDateUniversal = $endDate.ToUniversalTime().ToString('o')
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    $LoginpropertyMap = @{
+        ProcessID = 0
+        Application = 1
+        DestAddress = 5
+        DestPort = 6
+    }
+
+    $xpath =    
+@"
+*[System
+    [TimeCreated
+        [@SystemTime>='$startDateUniversal' and 
+        @SystemTime<='$endDateUniversal']]
+    [EventID=5157]]
+"@
+
+    $events = Get-WinEvent -LogName "Security" -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
+   
+    # Loop through each event
+    foreach ($event in $events) {
+        $ProcessID = $event.Properties[$LoginpropertyMap.ProcessID].Value
+        $Application = $event.Properties[$LoginpropertyMap.Application].Value
+        $DestAddress = $event.Properties[$LoginpropertyMap.DestAddress].Value
+        $DestPort = $event.Properties[$LoginpropertyMap.DestPort].Value
+
+        # Add the extracted details to the results array
+        $result = [PSCustomObject]@{
+            'Time Created (UTC)' = $event.TimeCreated.ToUniversalTime()
+            'User'               = $event.UserId
+            'LogName'            = $event.LogName
+            'Event ID'           = $event.Id
+            'Message'            = "WFP blocked $($Application.split("\")[-1]) attempting connection to $DestAddress : $DestPort"
+            'Details'            =
+@"
+Destination IP: $DestAddress
+Destination Port: $DestPort
+Application: $Application
+ProcessID: $ProcessID
+"@ 
+        }
+        $results.Add($result)
+    }
+    return $results 
+}
+
+function Get-WFPApproved{
+    # Collect params, start/end date, and how many events to grab. 
+    # Defaults to 99999 events and anything from 01/01/1980 to the day after execution 
+    param(
+        [Parameter(Mandatory=$true)]    
+        [datetime]
+        $startDate,
+
+        [Parameter(Mandatory=$true)]
+        [datetime]
+        $endDate,
+
+        [Parameter(Mandatory=$true)]
+        [int]
+        $maxEvents
+    )
+
+    $startDateUniversal = $startDate.ToUniversalTime().ToString('o')
+    $endDateUniversal = $endDate.ToUniversalTime().ToString('o')
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    $LoginpropertyMap = @{
+        ProcessID = 0
+        Application = 1
+        DestAddress = 5
+        DestPort = 6
+    }
+
+    $xpath =    
+@"
+*[System
+    [TimeCreated
+        [@SystemTime>='$startDateUniversal' and 
+        @SystemTime<='$endDateUniversal']]
+    [EventID=5156]]
+"@
+
+    $events = Get-WinEvent -LogName "Security" -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
+   
+    # Loop through each event
+    foreach ($event in $events) {
+        $ProcessID = $event.Properties[$LoginpropertyMap.ProcessID].Value
+        $Application = $event.Properties[$LoginpropertyMap.Application].Value
+        $DestAddress = $event.Properties[$LoginpropertyMap.DestAddress].Value
+        $DestPort = $event.Properties[$LoginpropertyMap.DestPort].Value
+
+        # Add the extracted details to the results array
+        $result = [PSCustomObject]@{
+            'Time Created (UTC)' = $event.TimeCreated.ToUniversalTime()
+            'User'               = $event.UserId
+            'LogName'            = $event.LogName
+            'Event ID'           = $event.Id
+            'Message'            = "WFP allowed $($Application.split("\")[-1]) connection to $DestAddress : $DestPort"
+            'Details'            =
+@"
+Destination IP: $DestAddress
+Destination Port: $DestPort
+Application: $Application
+ProcessID: $ProcessID
+"@ 
+        }
+        $results.Add($result)
+    }
+    return $results 
+}
+
+function Get-TaskScheduleRegister{
+    # Collect params, start/end date, and how many events to grab. 
+    # Defaults to 99999 events and anything from 01/01/1980 to the day after execution 
+    param(
+        [Parameter(Mandatory=$true)]    
+        [datetime]
+        $startDate,
+
+        [Parameter(Mandatory=$true)]
+        [datetime]
+        $endDate,
+
+        [Parameter(Mandatory=$true)]
+        [int]
+        $maxEvents
+    )
+
+    $startDateUniversal = $startDate.ToUniversalTime().ToString('o')
+    $endDateUniversal = $endDate.ToUniversalTime().ToString('o')
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    $LoginpropertyMap = @{
+        TaskName = 0
+        AccountName = 1
+    }
+
+    $xpath =    
+@"
+*[System
+    [TimeCreated
+        [@SystemTime>='$startDateUniversal' and 
+        @SystemTime<='$endDateUniversal']]
+    [EventID=106]]
+"@
+
+    $events = Get-WinEvent -LogName "Microsoft-Windows-TaskScheduler/Operational" -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
+   
+    # Loop through each event
+    foreach ($event in $events) {
+        $TaskName = $event.Properties[$LoginpropertyMap.TaskName].Value
+        $AccountName = $event.Properties[$LoginpropertyMap.AccountName].Value
+
+        # Add the extracted details to the results array
+        $result = [PSCustomObject]@{
+            'Time Created (UTC)' = $event.TimeCreated.ToUniversalTime()
+            'User'               = $event.UserId
+            'LogName'            = $event.LogName
+            'Event ID'           = $event.Id
+            'Message'            = "$AccountName scheduled task $TaskName"
+            'Details'            = $null
+        }
+        $results.Add($result)
+    }
+    return $results 
+}
+
 $allResultsList = New-Object System.Collections.Generic.List[PSCustomObject]
 
-# Get login events
-$result_UserSessions = Get-UserSessions -startDate $startDateFormatted -endDate $endDateFormatted -maxEvents $maxEvents
-if ($result_UserSessions.count -eq 0){
-    Write-Host "No login/logout events (4264/4634) found." -ForegroundColor Yellow
-} else {
-    $allResultsList.Add($result_UserSessions)
+switch ($PSBoundParameters){
+    {$_.ContainsKey("help")}{
+        Get-Help
+        exit
+    }
+    {$true}{
+        $text = 
+@"
+ ____ ____ ____ ____ ____ ____ ____ ____ ____ ____ ____           
+||P |||o |||w |||e |||r |||S |||l |||e |||u |||t |||h ||          
+||__|||__|||__|||__|||__|||__|||__|||__|||__|||__|||__||          
+|/__\|/__\|/__\|/__\|/__\|/__\|/__\|/__\|/__\|/__\|/__\|                                                                                                                                                                                                                                                         
+"@    
+        Write-Output $text
+        
+        $functionCalls = @{
+            "Get-UserSessions"         = "No login/logout events (4264/4634) found!"
+            "Get-OutboundRDPAttempt"   = "No Outbound RDP events (1024) found!"
+            "Get-ServicesInstalled"    = "No service install events (7045) found!"
+            "Get-DefenderDetections"   = "No Defender events (1116) found!"
+            "Get-GenericLogClearing"   = "No log clearing events (104) found!"
+            "Get-SystemStartup"        = "No system startup events (4608) found!"
+            "Get-SystemShutdown"       = "No system startup events (4609) found!"
+            "Get-TermServSessions"     = "No system RDP login/logoff events (21/23) found!"
+            "Get-FailedLogons"         = "No failed login events (4625) found!"
+            "Get-PowerShellEvents"     = "No PowerShell events (400) found!"
+            "Get-SecurityLogClearing"  = "No log clearing events (1102) found!"
+            "Get-TaskScheduleRegister" = "No task schedule registration events (106) found!"
+        }
+        
+        if ($sysmon){
+            $functionCalls.Add("Get-SysmonProcessCreate", "No Sysmon process creation events (1)")
+            $functionCalls.Add("Get-SysmonNetCreate", "No Sysmon network creation events (3)")
+            $functionCalls.Add("Get-SysmonFileCreate", "No Sysmon File creation events (11)")
+        }
+        
+        if ($extended){
+            $functionCalls.Add("Get-WFPBlocked", "No WFP network connection blocked events (5157)")
+            $functionCalls.Add("Get-WFPApproved", "No WFP network connection approved events (5156)")
+        }
+        
+        foreach ($functionCall in $functionCalls.GetEnumerator()) {
+            # Dynamically calling the function
+            write-host "Running $($functionCall.Name)..."
+
+            $result = Invoke-Expression "$($functionCall.Name) -startDate '$startDateFormatted' -endDate '$endDateFormatted' -maxEvents $maxEvents"
+
+            if ($result.Count -eq 0) {
+                Write-Host "    $($functionCall.Value)" -ForegroundColor Yellow
+            } else {
+                write-host "    $($result.count) results recorded!" -ForegroundColor Green
+                foreach ($item in $result){
+                    $allResultsList.Add($item)}
+            }
+        }   
+    } 
+    {$_.ContainsKey("csv")}{
+        write-host "Output to CSV selected..."
+        $OutputFile = Get-OutputPreCheck $CSV
+        write-host "Validated output directory. File will be $OutputFile"
+        $allResultsList | Export-Csv -NoTypeInformation -Path $OutputFile
+    }
+    {$_.ContainsKey("quiet") -eq $false}{
+        $allResultsList | Select-Object 'Time Created (UTC)', 'Message'
+    }       
 }
-
-# Get outbound RDP attempts
-$result_OutboundRDPAttempt = Get-OutboundRDPAttempt -startDate $startDateFormatted -endDate $endDateFormatted -maxEvents $maxEvents
-if ($result_OutboundRDPAttempt.count -eq 0){
-    Write-Host "No Outbound RDP events (1024) found." -ForegroundColor Yellow
-} else {
-    $allResultsList.Add($result_OutboundRDPAttempt)
-}
-
-# Get Service install events
-$result_ServicesInstalled = Get-ServicesInstalled -startDate $startDateFormatted -endDate $endDateFormatted -maxEvents $maxEvents
-if ($result_ServicesInstalled.count -eq 0){
-    Write-Host "No service install events (7045) found." -ForegroundColor Yellow
-} else {
-    $allResultsList.Add($result_ServicesInstalled)
-}
-
-# Get System Startup events
-$result_SystemStartup = Get-SystemStartup -startDate $startDateFormatted -endDate $endDateFormatted -maxEvents $maxEvents
-if ($result_SystemStartup.count -eq 0){
-    Write-Host "No system startup events (4608) found." -ForegroundColor Yellow
-} else {
-    $allResultsList.Add($result_SystemStartup)
-}
-
-# Get System shutdown events
-$result_SystemShutdown = Get-SystemShutdown -startDate $startDateFormatted -endDate $endDateFormatted -maxEvents $maxEvents
-if ($result_SystemShutdown.count -eq 0){
-    Write-Host "No system startup events (4609) found." -ForegroundColor Yellow
-} else {
-    $allResultsList.Add($result_SystemShutdown)
-}
-
-# Get RDP events
-$result_TermServSessions = Get-TermServSessions -startDate $startDateFormatted -endDate $endDateFormatted -maxEvents $maxEvents
-if ($result_TermServSessions.count -eq 0){
-    Write-Host "No system RDP login/logoff events (21/23) found." -ForegroundColor Yellow
-} else {
-    $allResultsList.Add($result_TermServSessions)
-}
-
-# Get Failed Login events
-$result_FailedLogons = Get-FailedLogons -startDate $startDateFormatted -endDate $endDateFormatted -maxEvents $maxEvents
-if ($result_FailedLogons.count -eq 0){
-    Write-Host "No failed login events (4625) found." -ForegroundColor Yellow
-} else {
-    $allResultsList.Add($result_FailedLogons)
-}
-
-# Get Failed Login events
-$result_PowerShellEvents = Get-PowerShellEvents -startDate $startDateFormatted -endDate $endDateFormatted -maxEvents $maxEvents
-if ($result_PowerShellEvents.count -eq 0){
-    Write-Host "No PowerShell events (400) found." -ForegroundColor Yellow
-} else {
-    $allResultsList.Add($result_PowerShellEvents)
-}
-
-# Get Failed Login events
-$result_GenericLogClearing = Get-GenericLogClearing -startDate $startDateFormatted -endDate $endDateFormatted -maxEvents $maxEvents
-if ($result_GenericLogClearing.count -eq 0){
-    Write-Host "No log clearing events (104) found." -ForegroundColor Yellow
-} else {
-    $allResultsList.Add($result_GenericLogClearing)
-}
-
-
-$allResultsList | format-table
-
 
