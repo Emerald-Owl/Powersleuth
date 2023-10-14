@@ -9,39 +9,53 @@ param(
     [Alias("q")][switch] $quiet
 )
 
-# Check for MM/dd/yyyy formatting of the start date param
-try {
+$patternDate = "^\d{2}/\d{2}/\d{4}$"
+$patternDateTime = "^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}$"
+
+# Check if the string matches the date-time format
+if ($startDate -match $patternDateTime) {
+    $startDateFormatted = [datetime]::ParseExact($startDate, "MM/dd/yyyy HH:mm:ss", $null)
+}
+# Check if the string matches the date-only format
+elseif ($startDate -match $patternDate) {
     $startDateFormatted = [datetime]::ParseExact($startDate, "MM/dd/yyyy", $null)
+}
+else {
+    Write-Host "Invalid date format on startdate. Please use MM/dd/yyyy. or Please use MM/dd/yyyy. HH:mm:ss" -ForegroundColor Red
+    return
+}
+
+# Check if the string matches the date-time format
+if ($endDate -match $patternDateTime) {
+    $endDateFormatted = [datetime]::ParseExact($endDate, "MM/dd/yyyy HH:mm:ss", $null)
+}
+# Check if the string matches the date-only format
+elseif ($endDate -match $patternDate) {
     $endDateFormatted = [datetime]::ParseExact($endDate, "MM/dd/yyyy", $null)
-} 
-catch {
-    Write-Host "Invalid date format. Please use MM/dd/yyyy." -ForegroundColor Red
+}
+else {
+    Write-Host "Invalid date format on enddate. Please use MM/dd/yyyy. or Please use MM/dd/yyyy. HH:mm:ss" -ForegroundColor Red
     return
 }
 
 function Get-Help {
-    Write-Output "NEEDS UPDATING
+    Write-Output "
         Usage: 
-            .\powersleuth.ps1 -d <num> [options]
+            .\powersleuth.ps1 [options]
     
         Options:
             -h, -help                  Prints help information
-            -s, -search <string>       Conduct a search for a string. Not case sensitive. String or regex 
-            -d, -days <num>            Specify how many days back to search
-            -c, -csv <directory>       Export results as a csv file 
-            -o, -offline <directory>   Parse offline EVTX files, will use local logs otherwise
-            -p, -poll                  Look at account logins statistics
-            -l, -logins                Shows only login/logoff events (security and terminalservices)
-            -x, -xsearch <string>      Search for keyword across ALL event logs. Requires CSV. String or regex
-            -i, -ids <numbers>         Search by ID. Accepts a single ID or Regex, can be used with -s 
-            -q, -quiet                 Does not print results to terminal. Requires CSV output. 
+            -startdate <datetime>      MM/dd/yyyy or MM/dd/yyyy HH:mm:ss of when to start in UTC. Defaults to 01/01/1980.
+            -enddate <datetime>        MM/dd/yyyy or MM/dd/yyyy HH:mm:ss of when to end in UTC. Defaults to tomorrows date. 
+            -csv <directory>           Export results as a csv file 
+            -q, -quiet                 Does not print results to terminal.
+            -maxevents <int>           Specify the maximum number of events to accept from each individual log search.
+            -sysmon                    Parses sysmon events (Can be extremely noisey)
+            -extended                  Parses WFP events and process creation (4688) (Can be extremely noisey)
     
         Examples:
-            .\powersleuth.ps1 -d 30 -p
-            .\powersleuth.ps1 -d 5 -l
-            .\powersleuth.ps1 -d 10 -s 'Administrator'
-            .\powersleuth.ps1 -d 10 -o 'E:\C\Windows\system32\winevt\Logs' -c '..\output\'
-            .\powersleuth.ps1 -d 60 -x 'psexe|anonymous' -o 'D:\C\Windows\System32\winevt\logs' -csv '..\Desktop\'
+            .\powersleuth.ps1 -startDate '10/01/2023 10:00:00' -endDate '10/11/2023 10:00:00' -csv .\
+            .\powersleuth.ps1 -q -max 30 -csv .\
         "
 }
 
@@ -134,7 +148,7 @@ function Get-UserSessions{
         $accountName = $event.Properties[$LoginpropertyMap.AccountName].Value
         $accountDomain = $event.Properties[$LoginpropertyMap.AccountDomain].Value
         $logonID = '0x{0:X}' -f [int64]$event.Properties[$LoginpropertyMap.LogonID].Value
-        $logonType = $event.Properties[$LoginpropertyMap.LogonType].Value
+        $logonTypeRaw = $event.Properties[$LoginpropertyMap.LogonType].Value
         $processName = $event.Properties[$LoginpropertyMap.ProcessName].Value
         $workstationName = $event.Properties[$LoginpropertyMap.WorkstationName].Value
         $sourceAddress = $event.Properties[$LoginpropertyMap.SourceAddress].Value
@@ -152,18 +166,37 @@ function Get-UserSessions{
             default { $elevatedTokenRaw } 
         }
 
+        $logonType = switch ($logonTypeRaw) {
+            "2" { "Interactive" }
+            "3" { "Network" } 
+            "4" { "Batch" } 
+            "5" { "Service" } 
+            "7" { "Unlock" } 
+            "8" { "NetworkCleartext" }
+            "9" { "NewCredentials" }
+            "10" { "RDP" }
+            "11" { "CachedInteractive" }
+            default { $logonTypeRaw } 
+        }
+
+        if ($elevatedToken -eq "Yes"){
+            $message = "$accountName logged in from $sourceAddress, ID: $logonID, type: $logonType (Elevated)"
+        } else{
+            $message = "$accountName logged in from $sourceAddress, ID: $logonID, type: $logonType"
+        }
+
         $result = [PSCustomObject]@{
             "Time Created (UTC)"     = $event.TimeCreated.ToUniversalTime()
             'User'               = $event.UserId
             'LogName'            = $event.LogName
             'Event ID'           = $event.Id
-            'Message'            = "$accountName logged in from $sourceAddress"
+            'Message'            = $message
             'Details'            = 
 @"
 Account Name: $accountName
 Domain: $accountDomain
 Logon ID: $logonID
-Logon Type: $logonType
+Logon Type: $logonTypeRaw ($logonType)
 Process Name: $processName
 Workstation Name: $workstationName
 Source Network Address: $sourceAddress
@@ -221,7 +254,7 @@ $xpath =
             'User'               = $event.UserId
             'LogName'            = $event.LogName
             'Event ID'           = $event.Id
-            'Message'            = "$accountName logged off"
+            'Message'            = "$accountName logged off, ID: $logonID"
             'Details'            = 
 @"
 Account Name: $accountName
@@ -729,7 +762,7 @@ function Get-PowerShellEvents{
                 'User'               = $event.UserId
                 'LogName'            = $event.LogName
                 'Event ID'           = $event.Id
-                'Message'            = $command
+                'Message'            = "Command executed: $command"
                 'Details'            = $null
             }
         }
@@ -1311,6 +1344,460 @@ function Get-TaskScheduleRegister{
     return $results 
 }
 
+function Get-ProcessCreation{
+    # Collect params, start/end date, and how many events to grab. 
+    # Defaults to 99999 events and anything from 01/01/1980 to the day after execution 
+    param(
+        [Parameter(Mandatory=$true)]    
+        [datetime]
+        $startDate,
+
+        [Parameter(Mandatory=$true)]
+        [datetime]
+        $endDate,
+
+        [Parameter(Mandatory=$true)]
+        [int]
+        $maxEvents
+    )
+
+    $startDateUniversal = $startDate.ToUniversalTime().ToString('o')
+    $endDateUniversal = $endDate.ToUniversalTime().ToString('o')
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    $LoginpropertyMap = @{
+        TargetUserName = 10
+        TargetLogonId = 12
+        NewProcessName = 5
+        ProcessId = 7
+        CommandLine = 8
+    }
+
+    $xpath =    
+@"
+*[System
+    [TimeCreated
+        [@SystemTime>='$startDateUniversal' and 
+        @SystemTime<='$endDateUniversal']]
+    [EventID=4688]]
+"@
+
+    $events = Get-WinEvent -LogName "Security" -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
+   
+    # Loop through each event
+    foreach ($event in $events) {
+        $TargetUserName = $event.Properties[$LoginpropertyMap.TargetUserName].Value
+        $TargetLogonId = $event.Properties[$LoginpropertyMap.TargetLogonId].Value
+        $NewProcessName = $event.Properties[$LoginpropertyMap.NewProcessName].Value
+        $ProcessId = $event.Properties[$LoginpropertyMap.ProcessId].Value
+        $CommandLine = $event.Properties[$LoginpropertyMap.CommandLine].Value
+
+        # Add the extracted details to the results array
+        $result = [PSCustomObject]@{
+            'Time Created (UTC)' = $event.TimeCreated.ToUniversalTime()
+            'User'               = $event.UserId
+            'LogName'            = $event.LogName
+            'Event ID'           = $event.Id
+            'Message'            = "$TargetUserName started process $NewProcessName"
+            'Details'            =
+@"
+Process Name: $NewProcessName
+Command Line: $CommandLine
+Process ID: $ProcessId
+Account Name: $TargetUserName
+LogonID: $TargetLogonId
+"@ 
+        }
+        $results.Add($result)
+    }
+    return $results 
+}
+
+function Get-AccountCreation{
+    # Collect params, start/end date, and how many events to grab. 
+    # Defaults to 99999 events and anything from 01/01/1980 to the day after execution 
+    param(
+        [Parameter(Mandatory=$true)]    
+        [datetime]
+        $startDate,
+
+        [Parameter(Mandatory=$true)]
+        [datetime]
+        $endDate,
+
+        [Parameter(Mandatory=$true)]
+        [int]
+        $maxEvents
+    )
+
+    $startDateUniversal = $startDate.ToUniversalTime().ToString('o')
+    $endDateUniversal = $endDate.ToUniversalTime().ToString('o')
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    $LoginpropertyMap = @{
+        TargetUserName = 0
+        TargetDomainName = 1
+        TargetSid = 2
+        SubjectUserSid = 3
+        SubjectUserName = 4
+        SubjectDomainName = 5
+        SubjectLogonId = 6
+        PrivilegeList = 7
+    }
+
+    $xpath =    
+@"
+*[System
+    [TimeCreated
+        [@SystemTime>='$startDateUniversal' and 
+        @SystemTime<='$endDateUniversal']]
+    [EventID=4720]]
+"@
+
+    $events = Get-WinEvent -LogName "Security" -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
+   
+    # Loop through each event
+    foreach ($event in $events) {
+        $TargetUserName = $event.Properties[$LoginpropertyMap.TargetUserName].Value
+        $TargetDomainName = $event.Properties[$LoginpropertyMap.TargetDomainName].Value
+        $TargetSid = $event.Properties[$LoginpropertyMap.TargetSid].Value
+        $SubjectUserSid = $event.Properties[$LoginpropertyMap.SubjectUserSid].Value
+        $SubjectUserName = $event.Properties[$LoginpropertyMap.SubjectUserName].Value
+        $SubjectDomainName = $event.Properties[$LoginpropertyMap.SubjectDomainName].Value
+        $SubjectLogonId = $event.Properties[$LoginpropertyMap.SubjectLogonId].Value
+        $PrivilegeList = $event.Properties[$LoginpropertyMap.PrivilegeList].Value
+
+        # Add the extracted details to the results array
+        $result = [PSCustomObject]@{
+            'Time Created (UTC)' = $event.TimeCreated.ToUniversalTime()
+            'User'               = $event.UserId
+            'LogName'            = $event.LogName
+            'Event ID'           = $event.Id
+            'Message'            = "Account $TargetDomainName\$TargetUserName was created by $SubjectDomainName\$SubjectUserName"
+            'Details'            =
+@"
+New Account Name: $TargetUserName
+New Account Domain: $TargetDomainName
+New Account SID: $TargetSid
+Privledge List: $PrivilegeList
+Initiating Account Name: $SubjectUserName
+Initiating Account Domain: $SubjectDomainName
+Initiating Account SID: $SubjectUserSid
+Initiating Account LogonID: $SubjectLogonId
+"@ 
+        }
+        $results.Add($result)
+    }
+    return $results 
+}
+
+function Get-AccountEnabled{
+    # Collect params, start/end date, and how many events to grab. 
+    # Defaults to 99999 events and anything from 01/01/1980 to the day after execution 
+    param(
+        [Parameter(Mandatory=$true)]    
+        [datetime]
+        $startDate,
+
+        [Parameter(Mandatory=$true)]
+        [datetime]
+        $endDate,
+
+        [Parameter(Mandatory=$true)]
+        [int]
+        $maxEvents
+    )
+
+    $startDateUniversal = $startDate.ToUniversalTime().ToString('o')
+    $endDateUniversal = $endDate.ToUniversalTime().ToString('o')
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    $LoginpropertyMap = @{
+        TargetUserName = 0
+        TargetDomainName = 1
+        TargetSid = 2
+        SubjectUserSid = 3
+        SubjectUserName = 4
+        SubjectDomainName = 5
+        SubjectLogonId = 6
+    }
+
+    $xpath =    
+@"
+*[System
+    [TimeCreated
+        [@SystemTime>='$startDateUniversal' and 
+        @SystemTime<='$endDateUniversal']]
+    [EventID=4722]]
+"@
+
+    $events = Get-WinEvent -LogName "Security" -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
+   
+    # Loop through each event
+    foreach ($event in $events) {
+        $TargetUserName = $event.Properties[$LoginpropertyMap.TargetUserName].Value
+        $TargetDomainName = $event.Properties[$LoginpropertyMap.TargetDomainName].Value
+        $TargetSid = $event.Properties[$LoginpropertyMap.TargetSid].Value
+        $SubjectUserSid = $event.Properties[$LoginpropertyMap.SubjectUserSid].Value
+        $SubjectUserName = $event.Properties[$LoginpropertyMap.SubjectUserName].Value
+        $SubjectDomainName = $event.Properties[$LoginpropertyMap.SubjectDomainName].Value
+        $SubjectLogonId = $event.Properties[$LoginpropertyMap.SubjectLogonId].Value
+
+        # Add the extracted details to the results array
+        $result = [PSCustomObject]@{
+            'Time Created (UTC)' = $event.TimeCreated.ToUniversalTime()
+            'User'               = $event.UserId
+            'LogName'            = $event.LogName
+            'Event ID'           = $event.Id
+            'Message'            = "Account $TargetDomainName\$TargetUserName was enabled by $SubjectDomainName\$SubjectUserName"
+            'Details'            =
+@"
+Enabled Account Name: $TargetUserName
+Enabled Account Domain: $TargetDomainName
+Enabled Account SID: $TargetSid
+Initiating Account Name: $SubjectUserName
+Initiating Account Domain: $SubjectDomainName
+Initiating Account SID: $SubjectUserSid
+Initiating Account LogonID: $SubjectLogonId
+"@ 
+        }
+        $results.Add($result)
+    }
+    return $results 
+}
+
+function Get-PasswordResetAttempt{
+    # Collect params, start/end date, and how many events to grab. 
+    # Defaults to 99999 events and anything from 01/01/1980 to the day after execution 
+    param(
+        [Parameter(Mandatory=$true)]    
+        [datetime]
+        $startDate,
+
+        [Parameter(Mandatory=$true)]
+        [datetime]
+        $endDate,
+
+        [Parameter(Mandatory=$true)]
+        [int]
+        $maxEvents
+    )
+
+    $startDateUniversal = $startDate.ToUniversalTime().ToString('o')
+    $endDateUniversal = $endDate.ToUniversalTime().ToString('o')
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    $LoginpropertyMap = @{
+        TargetUserName = 0
+        TargetDomainName = 1
+        TargetSid = 2
+        SubjectUserSid = 3
+        SubjectUserName = 4
+        SubjectDomainName = 5
+        SubjectLogonId = 6
+    }
+
+    $xpath =    
+@"
+*[System
+    [TimeCreated
+        [@SystemTime>='$startDateUniversal' and 
+        @SystemTime<='$endDateUniversal']]
+    [EventID=4724]]
+"@
+
+    $events = Get-WinEvent -LogName "Security" -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
+   
+    # Loop through each event
+    foreach ($event in $events) {
+        $TargetUserName = $event.Properties[$LoginpropertyMap.TargetUserName].Value
+        $TargetDomainName = $event.Properties[$LoginpropertyMap.TargetDomainName].Value
+        $TargetSid = $event.Properties[$LoginpropertyMap.TargetSid].Value
+        $SubjectUserSid = $event.Properties[$LoginpropertyMap.SubjectUserSid].Value
+        $SubjectUserName = $event.Properties[$LoginpropertyMap.SubjectUserName].Value
+        $SubjectDomainName = $event.Properties[$LoginpropertyMap.SubjectDomainName].Value
+        $SubjectLogonId = $event.Properties[$LoginpropertyMap.SubjectLogonId].Value
+
+        # Add the extracted details to the results array
+        $result = [PSCustomObject]@{
+            'Time Created (UTC)' = $event.TimeCreated.ToUniversalTime()
+            'User'               = $event.UserId
+            'LogName'            = $event.LogName
+            'Event ID'           = $event.Id
+            'Message'            = "Account $TargetDomainName\$TargetUserName attempted to reset $SubjectDomainName\$SubjectUserName's password"
+            'Details'            =
+@"
+New Account Name: $TargetUserName
+New Account Domain: $TargetDomainName
+New Account SID: $TargetSid
+Initiating Account Name: $SubjectUserName
+Initiating Account Domain: $SubjectDomainName
+Initiating Account SID: $SubjectUserSid
+Initiating Account LogonID: $SubjectLogonId
+"@ 
+        }
+        $results.Add($result)
+    }
+    return $results 
+}
+
+function Get-SecurityGroupAdd{
+    # Collect params, start/end date, and how many events to grab. 
+    # Defaults to 99999 events and anything from 01/01/1980 to the day after execution 
+    param(
+        [Parameter(Mandatory=$true)]    
+        [datetime]
+        $startDate,
+
+        [Parameter(Mandatory=$true)]
+        [datetime]
+        $endDate,
+
+        [Parameter(Mandatory=$true)]
+        [int]
+        $maxEvents
+    )
+
+    $startDateUniversal = $startDate.ToUniversalTime().ToString('o')
+    $endDateUniversal = $endDate.ToUniversalTime().ToString('o')
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    $LoginpropertyMap = @{
+        MemberName = 0
+        MemberSid = 1
+        TargetUserName = 2
+        TargetDomainName = 3
+        TargetSid = 4
+        SubjectUserSid = 5
+        SubjectUserName = 6
+        SubjectDomainName = 7
+        SubjectLogonId = 8
+    }
+
+    $xpath =    
+@"
+*[System
+    [TimeCreated
+        [@SystemTime>='$startDateUniversal' and 
+        @SystemTime<='$endDateUniversal']]
+    [EventID=4732]]
+"@
+
+    $events = Get-WinEvent -LogName "Security" -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
+   
+    # Loop through each event
+    foreach ($event in $events) {
+        $MemberName = $event.Properties[$LoginpropertyMap.MemberName].Value
+        $MemberSid = $event.Properties[$LoginpropertyMap.MemberSid].Value
+        $TargetUserName = $event.Properties[$LoginpropertyMap.TargetUserName].Value
+        $TargetDomainName = $event.Properties[$LoginpropertyMap.TargetDomainName].Value
+        $TargetSid = $event.Properties[$LoginpropertyMap.TargetSid].Value
+        $SubjectUserSid = $event.Properties[$LoginpropertyMap.SubjectUserSid].Value
+        $SubjectUserName = $event.Properties[$LoginpropertyMap.SubjectUserName].Value
+        $SubjectDomainName = $event.Properties[$LoginpropertyMap.SubjectDomainName].Value
+        $SubjectLogonId = $event.Properties[$LoginpropertyMap.SubjectLogonId].Value
+
+        # Add the extracted details to the results array
+        $result = [PSCustomObject]@{
+            'Time Created (UTC)' = $event.TimeCreated.ToUniversalTime()
+            'User'               = $event.UserId
+            'LogName'            = $event.LogName
+            'Event ID'           = $event.Id
+            'Message'            = "$SubjectDomainName\$SubjectUserName added an account to the $TargetUserName's group"
+            'Details'            =
+@"
+Target Account Name: $MemberName
+Target Account SID: $MemberSid
+Target Group Name: $TargetUserName
+Target Domain: $TargetDomainName
+Target Group SID: $TargetSid
+Initiating Account Name: $SubjectUserName
+Initiating Account Domain: $SubjectDomainName
+Initiating Account SID: $SubjectUserSid
+Initiating Account LogonID: $SubjectLogonId
+"@ 
+        }
+        $results.Add($result)
+    }
+    return $results 
+}
+
+function Get-AccountDeleted{
+    # Collect params, start/end date, and how many events to grab. 
+    # Defaults to 99999 events and anything from 01/01/1980 to the day after execution 
+    param(
+        [Parameter(Mandatory=$true)]    
+        [datetime]
+        $startDate,
+
+        [Parameter(Mandatory=$true)]
+        [datetime]
+        $endDate,
+
+        [Parameter(Mandatory=$true)]
+        [int]
+        $maxEvents
+    )
+
+    $startDateUniversal = $startDate.ToUniversalTime().ToString('o')
+    $endDateUniversal = $endDate.ToUniversalTime().ToString('o')
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    $LoginpropertyMap = @{
+        TargetUserName = 0
+        TargetDomainName = 1
+        TargetSid = 2
+        SubjectUserSid = 3
+        SubjectUserName = 4
+        SubjectDomainName = 5
+        SubjectLogonId = 6
+    }
+
+    $xpath =    
+@"
+*[System
+    [TimeCreated
+        [@SystemTime>='$startDateUniversal' and 
+        @SystemTime<='$endDateUniversal']]
+    [EventID=4726]]
+"@
+
+    $events = Get-WinEvent -LogName "Security" -FilterXPath $xpath -MaxEvents $maxEvents -ErrorAction SilentlyContinue
+   
+    # Loop through each event
+    foreach ($event in $events) {
+        $TargetUserName = $event.Properties[$LoginpropertyMap.TargetUserName].Value
+        $TargetDomainName = $event.Properties[$LoginpropertyMap.TargetDomainName].Value
+        $TargetSid = $event.Properties[$LoginpropertyMap.TargetSid].Value
+        $SubjectUserSid = $event.Properties[$LoginpropertyMap.SubjectUserSid].Value
+        $SubjectUserName = $event.Properties[$LoginpropertyMap.SubjectUserName].Value
+        $SubjectDomainName = $event.Properties[$LoginpropertyMap.SubjectDomainName].Value
+        $SubjectLogonId = $event.Properties[$LoginpropertyMap.SubjectLogonId].Value
+
+        # Add the extracted details to the results array
+        $result = [PSCustomObject]@{
+            'Time Created (UTC)' = $event.TimeCreated.ToUniversalTime()
+            'User'               = $event.UserId
+            'LogName'            = $event.LogName
+            'Event ID'           = $event.Id
+            'Message'            = "The account $TargetDomainName\$TargetUserName was deleted by $SubjectDomainName\$SubjectUserName"
+            'Details'            =
+@"
+Deleted Account Name: $MemberName
+Deleted Account Domain: $TargetDomainName
+Deleted Account SID: $MemberSid
+Initiating Account Name: $SubjectUserName
+Initiating Account Domain: $SubjectDomainName
+Initiating Account SID: $SubjectUserSid
+Initiating Account LogonID: $SubjectLogonId
+"@ 
+        }
+        $results.Add($result)
+    }
+    return $results 
+}
+
+
 $allResultsList = New-Object System.Collections.Generic.List[PSCustomObject]
 
 switch ($PSBoundParameters){
@@ -1341,17 +1828,23 @@ switch ($PSBoundParameters){
             "Get-PowerShellEvents"     = "No PowerShell events (400) found!"
             "Get-SecurityLogClearing"  = "No log clearing events (1102) found!"
             "Get-TaskScheduleRegister" = "No task schedule registration events (106) found!"
+            "Get-AccountCreation"      = "No account creation events (4720) found!"
+            "Get-AccountEnabled"       = "No account enabled events (4722) found!"
+            "Get-PasswordResetAttempt" = "No password reset attemoted by another user (4724) found!"
+            "Get-SecurityGroupAdd"     = "No account added to group events (4732) found!"
+            "Get-AccountDeleted"       = "No account deletion events (4726) found!"
         }
         
         if ($sysmon){
-            $functionCalls.Add("Get-SysmonProcessCreate", "No Sysmon process creation events (1)")
-            $functionCalls.Add("Get-SysmonNetCreate", "No Sysmon network creation events (3)")
-            $functionCalls.Add("Get-SysmonFileCreate", "No Sysmon File creation events (11)")
+            $functionCalls.Add("Get-SysmonProcessCreate", "No Sysmon process creation events (1) found!")
+            $functionCalls.Add("Get-SysmonNetCreate", "No Sysmon network creation events (3) found!")
+            $functionCalls.Add("Get-SysmonFileCreate", "No Sysmon File creation events (11) found!")
         }
         
         if ($extended){
-            $functionCalls.Add("Get-WFPBlocked", "No WFP network connection blocked events (5157)")
-            $functionCalls.Add("Get-WFPApproved", "No WFP network connection approved events (5156)")
+            $functionCalls.Add("Get-WFPBlocked", "No WFP network connection blocked events (5157) found!")
+            $functionCalls.Add("Get-WFPApproved", "No WFP network connection approved events (5156) found!")
+            $functionCalls.Add("Get-ProcessCreation", "No process creation events (4688) found!")
         }
         
         foreach ($functionCall in $functionCalls.GetEnumerator()) {
@@ -1376,7 +1869,7 @@ switch ($PSBoundParameters){
         $allResultsList | Export-Csv -NoTypeInformation -Path $OutputFile
     }
     {$_.ContainsKey("quiet") -eq $false}{
-        $allResultsList | Select-Object 'Time Created (UTC)', 'Message'
+        $allResultsList | Select-Object 'Time Created (UTC)', 'Message' | Sort-Object 'Time Created (UTC)' -Descending
     }       
 }
 
